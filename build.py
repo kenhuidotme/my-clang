@@ -148,7 +148,7 @@ def main() -> int:
         base_cmake_args.append("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
 
         # Require zlib compression.
-        zlib_dir = build_zlib()
+        zlib_dir = build_zlib(args.bootstrap)
         os.environ["PATH"] = zlib_dir + os.pathsep + os.environ.get("PATH", "")
 
         cflags += ["-I" + zlib_dir]
@@ -159,14 +159,14 @@ def main() -> int:
     # Statically link libxml2 to make lld-link not require mt.exe on Windows,
     # and to make sure lld-link output on other platforms is identical to
     # lld-link on Windows (for cross-builds).
-    libxml_cmake_args, libxml_cflags = build_libxml2()
+    libxml_cmake_args, libxml_cflags = build_libxml2(args.bootstrap)
     base_cmake_args += libxml_cmake_args
     cflags += libxml_cflags
     cxxflags += libxml_cflags
 
     if args.with_zstd:
         # Statically link zstd to make lld support zstd compression for debug info.
-        zstd_cmake_args, zstd_cflags = build_zstd()
+        zstd_cmake_args, zstd_cflags = build_zstd(args.bootstrap)
         base_cmake_args += zstd_cmake_args
         cflags += zstd_cflags
         cxxflags += zstd_cflags
@@ -253,6 +253,7 @@ def main() -> int:
         run_command(["ninja", "install"])
 
         print("Bootstrap compiler installed.")
+        return 0
 
     deployment_target = "10.15"
     deployment_env = os.environ.copy()
@@ -594,11 +595,16 @@ def detect_visual_studio() -> tuple[str, str]:
     )
 
 
-def build_zlib() -> str:
+def build_zlib(bootstrap = False) -> str:
     """Download and build zlib, and add to PATH."""
     ZLIB_VERSION = "zlib-1.2.11"
 
     zlib_dir = join(TOOLS_BUILD_DIR, ZLIB_VERSION)
+
+    if not bootstrap and exists(join(zlib_dir, "zlib.lib")):
+        return zlib_dir
+
+    print("Building zlib.")
     rmdir(zlib_dir)
 
     pack_file = join(TOOLS_DIR, ZLIB_VERSION + ".tar.gz")
@@ -639,17 +645,43 @@ def build_zlib() -> str:
     return zlib_dir
 
 
-def build_libxml2() -> tuple[list[str], list[str]]:
+def build_libxml2(bootstrap = False) -> tuple[list[str], list[str]]:
     """Download and build libxml2"""
     LIBXML2_VERSION = "libxml2-v2.9.12"
 
     src_dir = join(TOOLS_BUILD_DIR, LIBXML2_VERSION)
+
+    build_dir = join(src_dir, "build")
+    install_dir = join(build_dir, "install")
+    include_dir = join(install_dir, "include/libxml2")
+    lib_dir = join(install_dir, "lib")
+
+    if sys.platform == "win32":
+        libxml2_lib = join(lib_dir, "libxml2s.lib")
+    else:
+        libxml2_lib = join(lib_dir, "libxml2.a")
+
+    extra_cmake_flags = [
+        "-DLLVM_ENABLE_LIBXML2=FORCE_ON",
+        '-DLIBXML2_INCLUDE_DIR="%s"' % include_dir,
+        '-DLIBXML2_LIBRARIES="%s"' % libxml2_lib,
+        '-DLIBXML2_LIBRARY="%s"' % libxml2_lib,
+        # This hermetic libxml2 has enough features enabled for lld-link, but not
+        # for the libxml2 usage in libclang. We don't need libxml2 support in
+        # libclang, so just turn that off.
+        "-DCLANG_ENABLE_LIBXML2=NO",
+    ]
+    extra_cflags = ["-DLIBXML_STATIC"]
+
+    if not bootstrap and exists(libxml2_lib):
+        return extra_cmake_flags, extra_cflags
+
+    print("Building libxml2.")
     rmdir(src_dir)
 
     pack_file = join(TOOLS_DIR, LIBXML2_VERSION + ".tar.gz")
     unpack(pack_file, TOOLS_BUILD_DIR)
 
-    build_dir = join(src_dir, "build")
     os.mkdir(build_dir)
     os.chdir(build_dir)
 
@@ -707,33 +739,11 @@ def build_libxml2() -> tuple[list[str], list[str]]:
             "..",
         ]
     )
-
     run_command(["ninja", "install"])
-
-    install_dir = join(build_dir, "install")
-    include_dir = join(install_dir, "include/libxml2")
-    lib_dir = join(install_dir, "lib")
-
-    if sys.platform == "win32":
-        libxml2_lib = join(lib_dir, "libxml2s.lib")
-    else:
-        libxml2_lib = join(lib_dir, "libxml2.a")
-
-    extra_cmake_flags = [
-        "-DLLVM_ENABLE_LIBXML2=FORCE_ON",
-        '-DLIBXML2_INCLUDE_DIR="%s"' % include_dir,
-        '-DLIBXML2_LIBRARIES="%s"' % libxml2_lib,
-        '-DLIBXML2_LIBRARY="%s"' % libxml2_lib,
-        # This hermetic libxml2 has enough features enabled for lld-link, but not
-        # for the libxml2 usage in libclang. We don't need libxml2 support in
-        # libclang, so just turn that off.
-        "-DCLANG_ENABLE_LIBXML2=NO",
-    ]
-    extra_cflags = ["-DLIBXML_STATIC"]
     return extra_cmake_flags, extra_cflags
 
 
-def build_zstd() -> tuple[list[str], list[str]]:
+def build_zstd(bootstrap = False) -> tuple[list[str], list[str]]:
     """Download and build zstd lib"""
     ZSTD_VERSION = "zstd-1.5.5"
 
@@ -743,33 +753,8 @@ def build_zstd() -> tuple[list[str], list[str]]:
     # $ gsutil cp -n -a public-read zstd-$VER.tar.gz \
     #   gs://chromium-browser-clang/tools
     src_dir = join(TOOLS_BUILD_DIR, ZSTD_VERSION)
-    rmdir(src_dir)
-
-    pack_file = join(TOOLS_DIR, ZSTD_VERSION + ".tar.gz")
-    unpack(pack_file, TOOLS_BUILD_DIR)
 
     build_dir = join(src_dir, "cmake_build")
-    os.mkdir(build_dir)
-    os.chdir(build_dir)
-
-    run_command(
-        [
-            "cmake",
-            "-GNinja",
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DCMAKE_INSTALL_PREFIX=install",
-            # The mac_arm bot builds a clang arm binary, but currently on an intel
-            # host. If we ever move it to run on an arm mac, this can go. We
-            # could pass this only if args.build_mac_arm, but zstd is small, so
-            # might as well build it universal always for a few years.
-            '-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"',
-            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",  # /MT to match LLVM.
-            "-DZSTD_BUILD_SHARED=OFF",
-            "../build/cmake",
-        ]
-    )
-    run_command(["ninja", "install"])
-
     install_dir = join(build_dir, "install")
     include_dir = join(install_dir, "include")
     lib_dir = join(install_dir, "lib")
@@ -786,6 +771,37 @@ def build_zstd() -> tuple[list[str], list[str]]:
         '-Dzstd_LIBRARY="%s"' % zstd_lib,
     ]
     extra_cflags = []
+
+    if not bootstrap and exists(zstd_lib):
+        return extra_cmake_flags, extra_cflags
+
+    print("Building zstd.")
+    rmdir(src_dir)
+
+    pack_file = join(TOOLS_DIR, ZSTD_VERSION + ".tar.gz")
+    unpack(pack_file, TOOLS_BUILD_DIR)
+
+    os.mkdir(build_dir)
+    os.chdir(build_dir)
+
+    run_command(
+        [
+            "cmake",
+            "-GNinja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_INSTALL_PREFIX=install",
+            # The mac_arm bot builds a clang arm binary, but currently on an intel
+            # host. If we ever move it to run on an arm mac, this can go. We
+            # could pass this only if args.build_mac_arm, but zstd is small, so
+            # might as well build it universal always for a few years.
+            '-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"',
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",  # /MT to match LLVM.
+            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+            "-DZSTD_BUILD_SHARED=OFF",
+            "../build/cmake",
+        ]
+    )
+    run_command(["ninja", "install"])
     return extra_cmake_flags, extra_cflags
 
 
