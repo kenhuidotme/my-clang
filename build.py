@@ -71,33 +71,20 @@ LLVM_INSTALL_DIR = join(BUILD_DIR, "out/llvm-install")
 TOOLS_DIR = join(BUILD_DIR, "tools")
 TOOLS_BUILD_DIR = join(BUILD_DIR, "out/tools-build")
 
+macosx_deployment_target = "10.15"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build My Clang.")
     parser.add_argument(
         "--bootstrap",
         action="store_true",
-        help="first build clang with CC, then with itself.",
+        help="build bootstrap clang with CC first.",
     )
-    parser.add_argument("--build-dir", help="Override build directory")
-    parser.add_argument(
-        "--install-dir",
-        help="override the install directory for the final "
-        "compiler. If not specified, no install happens for "
-        "the compiler.",
-    )
-    parser.add_argument("--thinlto", action="store_true", help="build with ThinLTO")
     parser.add_argument(
         "--disable-asserts", action="store_true", help="build with asserts disabled"
     )
     parser.add_argument(
-        "--pic", action="store_true", help="Uses PIC when building LLVM"
-    )
-    parser.add_argument(
-        "--without-zstd",
-        dest="with_zstd",
-        action="store_false",
-        help="Disable zstd in the build",
+        "--pic", action="store_true", help="uses PIC when building LLVM"
     )
     parser.add_argument(
         "--run-tests", action="store_true", help="run tests after building"
@@ -109,9 +96,6 @@ def main() -> int:
     cxxflags = []
     ldflags = []
 
-    targets = "AArch64;ARM;LoongArch;Mips;PowerPC;RISCV;SystemZ;WebAssembly;X86"
-    projects = "clang;lld;clang-tools-extra"
-
     pic_default = sys.platform == "win32"
     pic_mode = "ON" if args.pic or pic_default else "OFF"
 
@@ -119,9 +103,7 @@ def main() -> int:
         "-GNinja",
         "-DCMAKE_BUILD_TYPE=Release",
         "-DLLVM_ENABLE_ASSERTIONS=%s" % ("OFF" if args.disable_asserts else "ON"),
-        '-DLLVM_ENABLE_PROJECTS="%s"' % projects,
         "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
-        '-DLLVM_TARGETS_TO_BUILD="%s"' % targets,
         f"-DLLVM_ENABLE_PIC={pic_mode}",
         "-DLLVM_ENABLE_Z3_SOLVER=OFF",
         "-DCLANG_PLUGIN_SUPPORT=OFF",
@@ -148,7 +130,7 @@ def main() -> int:
         base_cmake_args.append("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
 
         # Require zlib compression.
-        zlib_dir = build_zlib(args.bootstrap)
+        zlib_dir = build_zlib()
         os.environ["PATH"] = zlib_dir + os.pathsep + os.environ.get("PATH", "")
 
         cflags += ["-I" + zlib_dir]
@@ -159,17 +141,10 @@ def main() -> int:
     # Statically link libxml2 to make lld-link not require mt.exe on Windows,
     # and to make sure lld-link output on other platforms is identical to
     # lld-link on Windows (for cross-builds).
-    libxml_cmake_args, libxml_cflags = build_libxml2(args.bootstrap)
+    libxml_cmake_args, libxml_cflags = build_libxml2()
     base_cmake_args += libxml_cmake_args
     cflags += libxml_cflags
     cxxflags += libxml_cflags
-
-    if args.with_zstd:
-        # Statically link zstd to make lld support zstd compression for debug info.
-        zstd_cmake_args, zstd_cflags = build_zstd(args.bootstrap)
-        base_cmake_args += zstd_cmake_args
-        cflags += zstd_cflags
-        cxxflags += zstd_cflags
 
     # Preserve test environment
     lit_excludes = []
@@ -211,9 +186,11 @@ def main() -> int:
             # Need ARM and AArch64 for building the ios clang_rt.
             bootstrap_targets += ";ARM;AArch64"
 
+        bootstrap_projects = "clang;lld"
+
         bootstrap_args = base_cmake_args + [
             '-DLLVM_TARGETS_TO_BUILD="%s"' % bootstrap_targets,
-            '-DLLVM_ENABLE_PROJECTS="clang;lld"',
+            '-DLLVM_ENABLE_PROJECTS="%s"' % bootstrap_projects,
             '-DCMAKE_INSTALL_PREFIX="%s"' % LLVM_BOOTSTRAP_INSTALL_DIR,
             '-DCMAKE_C_FLAGS="%s"' % " ".join(cflags),
             '-DCMAKE_CXX_FLAGS="%s"' % " ".join(cxxflags),
@@ -243,7 +220,8 @@ def main() -> int:
         os.chdir(LLVM_BOOTSTRAP_BUILD_DIR)
 
         run_command(
-            ["cmake"] + bootstrap_args + ['"' + join(LLVM_PROJECT_DIR, "llvm") + '"']
+            ["cmake"] + bootstrap_args + ['"' + join(LLVM_PROJECT_DIR, "llvm") + '"'],
+            env=cmake_env()
         )
         run_command(["ninja"])
         if args.run_tests:
@@ -254,10 +232,6 @@ def main() -> int:
 
         print("Bootstrap compiler installed.")
         return 0
-
-    deployment_target = "10.15"
-    deployment_env = os.environ.copy()
-    deployment_env["MACOSX_DEPLOYMENT_TARGET"] = deployment_target
 
     # Build PDBs for archival on Windows.  Don't use RelWithDebInfo since it
     # has different optimization defaults than Release.
@@ -292,9 +266,13 @@ def main() -> int:
     if lld is not None:
         base_cmake_args.append('-DCMAKE_LINKER="%s"' % lld)
 
-    final_install_dir = args.install_dir if args.install_dir else LLVM_INSTALL_DIR
+    targets = "AArch64;ARM;LoongArch;Mips;PowerPC;RISCV;SystemZ;WebAssembly;X86"
+    projects = "clang;lld;clang-tools-extra"
 
     cmake_args = base_cmake_args + [
+        '-DLLVM_TARGETS_TO_BUILD="%s"' % targets,
+        '-DLLVM_ENABLE_PROJECTS="%s"' % projects,
+        '-DCMAKE_INSTALL_PREFIX="%s"' % LLVM_INSTALL_DIR,
         '-DCMAKE_C_COMPILER="%s"' % cc,
         '-DCMAKE_CXX_COMPILER="%s"' % cxx,
         '-DCMAKE_C_FLAGS="%s"' % " ".join(cflags),
@@ -302,15 +280,11 @@ def main() -> int:
         '-DCMAKE_EXE_LINKER_FLAGS="%s"' % " ".join(ldflags),
         '-DCMAKE_SHARED_LINKER_FLAGS="%s"' % " ".join(ldflags),
         '-DCMAKE_MODULE_LINKER_FLAGS="%s"' % " ".join(ldflags),
-        '-DCMAKE_INSTALL_PREFIX="%s"' % final_install_dir,
         # Link all binaries with lld. Effectively passes -fuse-ld=lld to the
         # compiler driver. On Windows, cmake calls the linker directly, so there
         # the same is achieved by passing -DCMAKE_LINKER=$lld above.
         "-DLLVM_ENABLE_LLD=ON",
     ]
-
-    if args.thinlto:
-        cmake_args.append("-DLLVM_ENABLE_LTO=Thin")
 
     # The default LLVM_DEFAULT_TARGET_TRIPLE depends on the host machine.
     # Set it explicitly to make the build of clang more hermetic.
@@ -424,7 +398,7 @@ def main() -> int:
         # specially handled.
         runtimes_triples_args["default"] = {
             "args": [
-                "SANITIZER_MIN_OSX_VERSION=" + deployment_target,
+                "SANITIZER_MIN_OSX_VERSION=" + macosx_deployment_target,
                 "COMPILER_RT_ENABLE_MACCATALYST=ON",
                 "COMPILER_RT_ENABLE_IOS=ON",
                 "COMPILER_RT_ENABLE_WATCHOS=OFF",
@@ -498,17 +472,26 @@ def main() -> int:
 
     run_command(
         ["cmake"] + cmake_args + ['"' + join(LLVM_PROJECT_DIR, "llvm") + '"'],
-        env=deployment_env,
+        env=cmake_env(),
     )
     run_command(["ninja"])
     if args.run_tests:
         run_command(["ninja", "check-all"], env=test_env)
 
     rmdir(LLVM_INSTALL_DIR)
+    # run_command(["ninja", "install"])
     run_command(["ninja"] + ["install-" + t for t in install_targets])
 
     print("Clang build was successful.")
     return 0
+
+
+def cmake_env():
+    env = None
+    if sys.platform == "darwin":
+        env = os.environ.copy()
+        env["MACOSX_DEPLOYMENT_TARGET"] = macosx_deployment_target
+    return env
 
 
 def compiler_rt_cmake_flags(profile=False, sanitizers=False) -> list[str]:
@@ -595,13 +578,13 @@ def detect_visual_studio() -> tuple[str, str]:
     )
 
 
-def build_zlib(bootstrap = False) -> str:
+def build_zlib() -> str:
     """Download and build zlib, and add to PATH."""
     ZLIB_VERSION = "zlib-1.2.11"
 
     zlib_dir = join(TOOLS_BUILD_DIR, ZLIB_VERSION)
 
-    if not bootstrap and exists(join(zlib_dir, "zlib.lib")):
+    if exists(join(zlib_dir, "zlib.lib")):
         return zlib_dir
 
     print("Building zlib.")
@@ -645,7 +628,7 @@ def build_zlib(bootstrap = False) -> str:
     return zlib_dir
 
 
-def build_libxml2(bootstrap = False) -> tuple[list[str], list[str]]:
+def build_libxml2() -> tuple[list[str], list[str]]:
     """Download and build libxml2"""
     LIBXML2_VERSION = "libxml2-v2.9.12"
 
@@ -673,7 +656,7 @@ def build_libxml2(bootstrap = False) -> tuple[list[str], list[str]]:
     ]
     extra_cflags = ["-DLIBXML_STATIC"]
 
-    if not bootstrap and exists(libxml2_lib):
+    if exists(libxml2_lib):
         return extra_cmake_flags, extra_cflags
 
     print("Building libxml2.")
@@ -737,69 +720,8 @@ def build_libxml2(bootstrap = False) -> tuple[list[str], list[str]]:
             "-DLIBXML2_WITH_XPTR=OFF",
             "-DLIBXML2_WITH_ZLIB=OFF",
             "..",
-        ]
-    )
-    run_command(["ninja", "install"])
-    return extra_cmake_flags, extra_cflags
-
-
-def build_zstd(bootstrap = False) -> tuple[list[str], list[str]]:
-    """Download and build zstd lib"""
-    ZSTD_VERSION = "zstd-1.5.5"
-
-    # The zstd-1.5.5.tar.gz was downloaded from
-    #   https://github.com/facebook/zstd/releases/
-    # and uploaded as follows.
-    # $ gsutil cp -n -a public-read zstd-$VER.tar.gz \
-    #   gs://chromium-browser-clang/tools
-    src_dir = join(TOOLS_BUILD_DIR, ZSTD_VERSION)
-
-    build_dir = join(src_dir, "cmake_build")
-    install_dir = join(build_dir, "install")
-    include_dir = join(install_dir, "include")
-    lib_dir = join(install_dir, "lib")
-
-    if sys.platform == "win32":
-        zstd_lib = join(lib_dir, "zstd_static.lib")
-    else:
-        zstd_lib = join(lib_dir, "libzstd.a")
-
-    extra_cmake_flags = [
-        "-DLLVM_ENABLE_ZSTD=ON",
-        "-DLLVM_USE_STATIC_ZSTD=ON",
-        '-Dzstd_INCLUDE_DIR="%s"' % include_dir,
-        '-Dzstd_LIBRARY="%s"' % zstd_lib,
-    ]
-    extra_cflags = []
-
-    if not bootstrap and exists(zstd_lib):
-        return extra_cmake_flags, extra_cflags
-
-    print("Building zstd.")
-    rmdir(src_dir)
-
-    pack_file = join(TOOLS_DIR, ZSTD_VERSION + ".tar.gz")
-    unpack(pack_file, TOOLS_BUILD_DIR)
-
-    os.mkdir(build_dir)
-    os.chdir(build_dir)
-
-    run_command(
-        [
-            "cmake",
-            "-GNinja",
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DCMAKE_INSTALL_PREFIX=install",
-            # The mac_arm bot builds a clang arm binary, but currently on an intel
-            # host. If we ever move it to run on an arm mac, this can go. We
-            # could pass this only if args.build_mac_arm, but zstd is small, so
-            # might as well build it universal always for a few years.
-            '-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"',
-            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",  # /MT to match LLVM.
-            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-            "-DZSTD_BUILD_SHARED=OFF",
-            "../build/cmake",
-        ]
+        ],
+        env=cmake_env()
     )
     run_command(["ninja", "install"])
     return extra_cmake_flags, extra_cflags
